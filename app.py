@@ -1,90 +1,71 @@
 import os
+import csv
 import json
 import time
-from datetime import datetime, timezone
 from flask import Flask, render_template, request, jsonify
-from flask_sqlalchemy import SQLAlchemy
 from openai import OpenAI
+from supabase import create_client
 from dotenv import load_dotenv
 
 load_dotenv()
 
 app = Flask(__name__)
 
-# ─── DB 설정 ──────────────────────────────────────────────────
-# Render는 DATABASE_URL을 postgres://로 제공하지만
-# SQLAlchemy 1.4+는 postgresql://을 요구하므로 치환
-database_url = os.getenv("DATABASE_URL", "sqlite:///local.db")
-if database_url.startswith("postgres://"):
-    database_url = database_url.replace("postgres://", "postgresql://", 1)
-
-app.config["SQLALCHEMY_DATABASE_URI"] = database_url
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
-db = SQLAlchemy(app)
+# ─── Supabase 설정 (채팅 이력 + 벡터 DB 통합) ────────────────
+supabase_url = os.getenv("SUPABASE_URL")
+supabase_key = os.getenv("SUPABASE_KEY")
+supabase = create_client(supabase_url, supabase_key)
 
 # OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+EMBEDDING_MODEL = "text-embedding-3-small"
 
-# ─── 모델 ─────────────────────────────────────────────────────
-class ChatHistory(db.Model):
-    __tablename__ = "chat_history"
 
-    id = db.Column(db.Integer, primary_key=True)
-    role = db.Column(db.String(10), nullable=False)        # "user" | "assistant"
-    message = db.Column(db.Text, nullable=False)
-    created_at = db.Column(
-        db.DateTime, default=lambda: datetime.now(timezone.utc)
-    )
+# ─── CSV 데이터 로딩 ──────────────────────────────────────────
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "role": self.role,
-            "message": self.message,
-            "created_at": self.created_at.isoformat(),
+
+def load_sample_data():
+    """data/ 폴더의 CSV 파일들을 읽어 SAMPLE_DATA 딕셔너리를 구성합니다."""
+    data = {}
+
+    # 월별 매출
+    with open(os.path.join(DATA_DIR, "monthly_sales.csv"), encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+        data["monthly_sales"] = {
+            "labels": [r["month"] for r in rows],
+            "datasets": [
+                {"label": "2025 매출 (만원)", "data": [int(r["sales_2025"]) for r in rows]},
+                {"label": "2024 매출 (만원)", "data": [int(r["sales_2024"]) for r in rows]},
+            ],
         }
 
+    # 카테고리 분포
+    with open(os.path.join(DATA_DIR, "category_distribution.csv"), encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+        data["category_distribution"] = {
+            "labels": [r["category"] for r in rows],
+            "data": [int(r["percentage"]) for r in rows],
+        }
 
-# 앱 시작 시 테이블 자동 생성
-with app.app_context():
-    db.create_all()
+    # 주간 방문자
+    with open(os.path.join(DATA_DIR, "weekly_visitors.csv"), encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+        data["weekly_visitors"] = {
+            "labels": [r["day"] for r in rows],
+            "data": [int(r["visitors"]) for r in rows],
+        }
+
+    # KPI
+    with open(os.path.join(DATA_DIR, "kpi.csv"), encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+        data["kpi"] = {r["metric"]: r["value"] for r in rows}
+
+    return data
 
 
-# ─── 샘플 데이터 ───────────────────────────────────────────────
-SAMPLE_DATA = {
-    "monthly_sales": {
-        "labels": ["1월", "2월", "3월", "4월", "5월", "6월",
-                    "7월", "8월", "9월", "10월", "11월", "12월"],
-        "datasets": [
-            {
-                "label": "2025 매출 (만원)",
-                "data": [1200, 1900, 1500, 2100, 2400, 2200,
-                         2800, 3100, 2900, 3400, 3200, 3800],
-            },
-            {
-                "label": "2024 매출 (만원)",
-                "data": [1000, 1400, 1300, 1700, 1900, 1800,
-                         2200, 2500, 2300, 2800, 2600, 3100],
-            },
-        ],
-    },
-    "category_distribution": {
-        "labels": ["전자제품", "의류", "식품", "도서", "스포츠"],
-        "data": [35, 25, 20, 10, 10],
-    },
-    "weekly_visitors": {
-        "labels": ["월", "화", "수", "목", "금", "토", "일"],
-        "data": [820, 932, 901, 934, 1290, 1330, 1320],
-    },
-    "kpi": {
-        "total_revenue": "3억 2,400만원",
-        "total_orders": "12,847건",
-        "avg_order_value": "25,200원",
-        "conversion_rate": "3.8%",
-    },
-}
+SAMPLE_DATA = load_sample_data()
 
 
 # ─── 라우트 ────────────────────────────────────────────────────
@@ -100,7 +81,22 @@ def chart_data():
     return jsonify(data)
 
 
-# ─── 챗봇 API (대화 기록 DB 저장) ─────────────────────────────
+# ─── RAG: 벡터 검색 ──────────────────────────────────────────
+def search_knowledge(query: str, match_count: int = 5) -> list[dict]:
+    """유저 질문을 임베딩하여 Supabase에서 유사 문서를 검색합니다."""
+    embedding_resp = client.embeddings.create(model=EMBEDDING_MODEL, input=query)
+    query_embedding = embedding_resp.data[0].embedding
+
+    result = supabase.rpc("match_documents", {
+        "query_embedding": query_embedding,
+        "match_threshold": 0.5,
+        "match_count": match_count,
+    }).execute()
+
+    return result.data if result.data else []
+
+
+# ─── 챗봇 API (RAG + Supabase 대화 기록) ─────────────────────
 @app.route("/api/chat", methods=["POST"])
 def chat():
     body = request.get_json()
@@ -109,10 +105,18 @@ def chat():
     if not user_message:
         return jsonify({"error": "메시지가 비어 있습니다."}), 400
 
-    # 유저 메시지 DB에 저장
-    user_record = ChatHistory(role="user", message=user_message)
-    db.session.add(user_record)
-    db.session.commit()
+    # 유저 메시지 Supabase에 저장
+    supabase.table("chat_history").insert({
+        "role": "user", "message": user_message
+    }).execute()
+
+    # RAG: 벡터 DB에서 관련 문서 검색
+    rag_context = ""
+    rag_docs = search_knowledge(user_message)
+    if rag_docs:
+        rag_context = "\n\n참고 자료 (벡터 DB 검색 결과):\n"
+        for doc in rag_docs:
+            rag_context += f"- [{doc['category']}] {doc['title']}: {doc['content']}\n"
 
     system_prompt = f"""당신은 데이터 분석 대시보드의 AI 어시스턴트입니다.
 아래 데이터를 기반으로 사용자의 질문에 한국어로 답변하세요.
@@ -124,15 +128,20 @@ def chat():
 - 카테고리 분포: {dict(zip(SAMPLE_DATA['category_distribution']['labels'], SAMPLE_DATA['category_distribution']['data']))}
 - 주간 방문자: {dict(zip(SAMPLE_DATA['weekly_visitors']['labels'], SAMPLE_DATA['weekly_visitors']['data']))}
 - KPI: {SAMPLE_DATA['kpi']}
-"""
+{rag_context}"""
 
     try:
         # 최근 대화 10건을 컨텍스트로 포함
-        recent = ChatHistory.query.order_by(ChatHistory.id.desc()).limit(10).all()
-        recent.reverse()
+        recent = supabase.table("chat_history") \
+            .select("role, message") \
+            .order("id", desc=True) \
+            .limit(10) \
+            .execute()
+        recent_rows = list(reversed(recent.data)) if recent.data else []
+
         messages = [{"role": "system", "content": system_prompt}]
-        for r in recent:
-            messages.append({"role": r.role, "content": r.message})
+        for r in recent_rows:
+            messages.append({"role": r["role"], "content": r["message"]})
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -142,10 +151,10 @@ def chat():
         )
         reply = response.choices[0].message.content
 
-        # 어시스턴트 응답 DB에 저장
-        bot_record = ChatHistory(role="assistant", message=reply)
-        db.session.add(bot_record)
-        db.session.commit()
+        # 어시스턴트 응답 Supabase에 저장
+        supabase.table("chat_history").insert({
+            "role": "assistant", "message": reply
+        }).execute()
 
         return jsonify({"reply": reply})
     except Exception as e:
@@ -157,17 +166,20 @@ def chat():
 def chat_history():
     """최근 대화 50건을 반환합니다."""
     limit = request.args.get("limit", 50, type=int)
-    records = ChatHistory.query.order_by(ChatHistory.id.desc()).limit(limit).all()
-    records.reverse()
-    return jsonify([r.to_dict() for r in records])
+    result = supabase.table("chat_history") \
+        .select("id, role, message, created_at") \
+        .order("id", desc=True) \
+        .limit(limit) \
+        .execute()
+    rows = list(reversed(result.data)) if result.data else []
+    return jsonify(rows)
 
 
 # ─── 대화 기록 삭제 API ───────────────────────────────────────
 @app.route("/api/chat/history", methods=["DELETE"])
 def clear_chat_history():
     """대화 기록을 모두 삭제합니다."""
-    ChatHistory.query.delete()
-    db.session.commit()
+    supabase.table("chat_history").delete().neq("id", 0).execute()
     return jsonify({"status": "ok"})
 
 
