@@ -1,7 +1,9 @@
 import os
 import json
 import time
+from datetime import datetime, timezone
 from flask import Flask, render_template, request, jsonify
+from flask_sqlalchemy import SQLAlchemy
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -9,8 +11,46 @@ load_dotenv()
 
 app = Flask(__name__)
 
+# ─── DB 설정 ──────────────────────────────────────────────────
+# Render는 DATABASE_URL을 postgres://로 제공하지만
+# SQLAlchemy 1.4+는 postgresql://을 요구하므로 치환
+database_url = os.getenv("DATABASE_URL", "sqlite:///local.db")
+if database_url.startswith("postgres://"):
+    database_url = database_url.replace("postgres://", "postgresql://", 1)
+
+app.config["SQLALCHEMY_DATABASE_URI"] = database_url
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+db = SQLAlchemy(app)
+
 # OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+
+# ─── 모델 ─────────────────────────────────────────────────────
+class ChatHistory(db.Model):
+    __tablename__ = "chat_history"
+
+    id = db.Column(db.Integer, primary_key=True)
+    role = db.Column(db.String(10), nullable=False)        # "user" | "assistant"
+    message = db.Column(db.Text, nullable=False)
+    created_at = db.Column(
+        db.DateTime, default=lambda: datetime.now(timezone.utc)
+    )
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "role": self.role,
+            "message": self.message,
+            "created_at": self.created_at.isoformat(),
+        }
+
+
+# 앱 시작 시 테이블 자동 생성
+with app.app_context():
+    db.create_all()
+
 
 # ─── 샘플 데이터 ───────────────────────────────────────────────
 SAMPLE_DATA = {
@@ -60,6 +100,7 @@ def chart_data():
     return jsonify(data)
 
 
+# ─── 챗봇 API (대화 기록 DB 저장) ─────────────────────────────
 @app.route("/api/chat", methods=["POST"])
 def chat():
     body = request.get_json()
@@ -68,7 +109,11 @@ def chat():
     if not user_message:
         return jsonify({"error": "메시지가 비어 있습니다."}), 400
 
-    # 시스템 프롬프트에 샘플 데이터 컨텍스트 제공
+    # 유저 메시지 DB에 저장
+    user_record = ChatHistory(role="user", message=user_message)
+    db.session.add(user_record)
+    db.session.commit()
+
     system_prompt = f"""당신은 데이터 분석 대시보드의 AI 어시스턴트입니다.
 아래 데이터를 기반으로 사용자의 질문에 한국어로 답변하세요.
 간결하고 인사이트 있는 답변을 제공하세요.
@@ -82,25 +127,53 @@ def chat():
 """
 
     try:
+        # 최근 대화 10건을 컨텍스트로 포함
+        recent = ChatHistory.query.order_by(ChatHistory.id.desc()).limit(10).all()
+        recent.reverse()
+        messages = [{"role": "system", "content": system_prompt}]
+        for r in recent:
+            messages.append({"role": r.role, "content": r.message})
+
         response = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
+            messages=messages,
             max_tokens=500,
             temperature=0.7,
         )
         reply = response.choices[0].message.content
+
+        # 어시스턴트 응답 DB에 저장
+        bot_record = ChatHistory(role="assistant", message=reply)
+        db.session.add(bot_record)
+        db.session.commit()
+
         return jsonify({"reply": reply})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
+# ─── 대화 기록 조회 API ───────────────────────────────────────
+@app.route("/api/chat/history")
+def chat_history():
+    """최근 대화 50건을 반환합니다."""
+    limit = request.args.get("limit", 50, type=int)
+    records = ChatHistory.query.order_by(ChatHistory.id.desc()).limit(limit).all()
+    records.reverse()
+    return jsonify([r.to_dict() for r in records])
+
+
+# ─── 대화 기록 삭제 API ───────────────────────────────────────
+@app.route("/api/chat/history", methods=["DELETE"])
+def clear_chat_history():
+    """대화 기록을 모두 삭제합니다."""
+    ChatHistory.query.delete()
+    db.session.commit()
+    return jsonify({"status": "ok"})
+
+
 # ─── 분석 API ──────────────────────────────────────────────────
 @app.route("/api/analysis", methods=["POST"])
 def analysis():
-    """LLM을 활용하여 선택된 차트 데이터에 대한 분석 인사이트를 생성합니다."""
     body = request.get_json()
     chart_type = body.get("chart_type", "monthly_sales")
     data = SAMPLE_DATA.get(chart_type, {})
